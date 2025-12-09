@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use std::fs::File;
-use std::io::prelude::*;
+use std::io::{prelude::*, Seek, SeekFrom};
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -38,13 +38,23 @@ fn main() -> Result<()> {
                 println!("{}", table_names.join(" "));
             }
         }
-        _ if command.to_uppercase().starts_with("SELECT") => {
+        _ => {
             let mut file = File::open(&args[1])?;
-            let table_name = parse_table_name(command);
-            let count = count_rows_in_table(&mut file, &table_name)?;
-            println!("{}", count);
+            let upper = command.to_uppercase();
+            if upper.starts_with("SELECT") && upper.contains("COUNT(*)") {
+                let table_name = parse_table_name(command);
+                let count = count_rows_in_table(&mut file, &table_name)?;
+                println!("{}", count);
+            } else if upper.starts_with("SELECT") {
+                let (col, table) = parse_select_column_query(command);
+                let values = select_column_from_table(&mut file, &table, &col)?;
+                for v in values {
+                    println!("{}", v);
+                }
+            } else {
+                bail!("Missing or invalid command passed: {}", command)
+            }
         }
-        _ => bail!("Missing or invalid command passed: {}", command),
     }
 
     Ok(())
@@ -84,7 +94,7 @@ fn read_table_names(file: &mut File) -> Result<Vec<String>> {
 }
 
 fn extract_tbl_name_from_cell(page: &[u8], cell_offset: usize) -> Result<String> {
-    let (payload_size, len1) = read_varint(page, cell_offset);
+    let (_payload_size, len1) = read_varint(page, cell_offset);
     let (_rowid, len2) = read_varint(page, cell_offset + len1);
     let header_start = cell_offset + len1 + len2;
     let (header_size, len3) = read_varint(page, header_start);
@@ -160,6 +170,7 @@ fn serial_type_size(serial: u64) -> usize {
 struct SchemaRow {
     tbl_name: String,
     rootpage: u32,
+    sql: String,
 }
 
 fn parse_table_name(query: &str) -> String {
@@ -169,6 +180,7 @@ fn parse_table_name(query: &str) -> String {
 }
 
 fn count_rows_in_table(file: &mut File, table_name: &str) -> Result<usize> {
+    file.seek(SeekFrom::Start(0))?;
     let mut header = [0u8; 100];
     file.read_exact(&mut header)?;
     let page_size = u16::from_be_bytes([header[16], header[17]]) as usize;
@@ -200,7 +212,7 @@ fn count_rows_in_table(file: &mut File, table_name: &str) -> Result<usize> {
     };
 
     let page_start: u64 = (rootpage as u64 - 1) * page_size as u64;
-    file.seek(std::io::SeekFrom::Start(page_start))?;
+    file.seek(SeekFrom::Start(page_start))?;
 
     let mut root_page = vec![0u8; page_size];
     file.read_exact(&mut root_page)?;
@@ -233,6 +245,7 @@ fn extract_schema_row_from_cell(page: &[u8], cell_offset: usize) -> Result<Schem
 
     let mut tbl_name = String::new();
     let mut rootpage: u32 = 0;
+    let mut sql = String::new();
 
     for col in 0..5 {
         let size = serial_type_size(serials[col]);
@@ -246,9 +259,143 @@ fn extract_schema_row_from_cell(page: &[u8], cell_offset: usize) -> Result<Schem
                 v = (v << 8) | (*b as u64);
             }
             rootpage = v as u32;
+        } else if col == 4 {
+            let bytes = &page[body_pos..body_pos + size];
+            sql = String::from_utf8(bytes.to_vec())?;
         }
         body_pos += size;
     }
 
-    Ok(SchemaRow { tbl_name, rootpage })
+    Ok(SchemaRow { tbl_name, rootpage, sql })
+}
+
+fn parse_select_column_query(query: &str) -> (String, String) {
+    let parts: Vec<&str> = query.split_whitespace().collect();
+    let col = parts.get(1).unwrap_or(&"").trim().trim_end_matches(',').to_string();
+    let table = parts.last().unwrap_or(&"").trim_end_matches(';').to_string();
+    (col, table)
+}
+
+fn select_column_from_table(file: &mut File, table_name: &str, column_name: &str) -> Result<Vec<String>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 100];
+    file.read_exact(&mut header)?;
+    let page_size = u16::from_be_bytes([header[16], header[17]]) as usize;
+
+    let mut page = vec![0u8; page_size];
+    page[..100].copy_from_slice(&header);
+    file.read_exact(&mut page[100..])?;
+
+    let page_header_offset = 100;
+    let cell_count =
+        u16::from_be_bytes([page[page_header_offset + 3], page[page_header_offset + 4]]) as usize;
+    let cell_ptr_array_offset = page_header_offset + 8;
+
+    let mut target_row: Option<SchemaRow> = None;
+
+    for i in 0..cell_count {
+        let idx = cell_ptr_array_offset + i * 2;
+        let cell_offset = u16::from_be_bytes([page[idx], page[idx + 1]]) as usize;
+        let row = extract_schema_row_from_cell(&page, cell_offset)?;
+        if row.tbl_name == table_name {
+            target_row = Some(row);
+            break;
+        }
+    }
+
+    let schema_row = match target_row {
+        Some(r) => r,
+        None => bail!("table not found"),
+    };
+
+    let col_index = get_column_index_from_sql(&schema_row.sql, column_name)?;
+
+    let page_start: u64 = (schema_row.rootpage as u64 - 1) * page_size as u64;
+    file.seek(SeekFrom::Start(page_start))?;
+
+    let mut root_page = vec![0u8; page_size];
+    file.read_exact(&mut root_page)?;
+
+    let root_header_offset = if schema_row.rootpage == 1 { 100 } else { 0 };
+    let cell_count =
+        u16::from_be_bytes([root_page[root_header_offset + 3], root_page[root_header_offset + 4]])
+            as usize;
+    let cell_ptr_array_offset = root_header_offset + 8;
+
+    let mut result = Vec::new();
+
+    for i in 0..cell_count {
+        let idx = cell_ptr_array_offset + i * 2;
+        let cell_offset = u16::from_be_bytes([root_page[idx], root_page[idx + 1]]) as usize;
+        if let Some(val) = extract_column_from_table_cell(&root_page, cell_offset, col_index)? {
+            result.push(val);
+        }
+    }
+
+    Ok(result)
+}
+
+fn get_column_index_from_sql(sql: &str, column_name: &str) -> Result<usize> {
+    let lower_sql = sql.to_lowercase();
+    let start = match lower_sql.find('(') {
+        Some(i) => i + 1,
+        None => bail!("invalid sql"),
+    };
+    let end = match lower_sql.rfind(')') {
+        Some(i) => i,
+        None => bail!("invalid sql"),
+    };
+    let cols_str = &sql[start..end];
+    let parts: Vec<&str> = cols_str.split(',').collect();
+    for (i, part) in parts.iter().enumerate() {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut iter = trimmed.split_whitespace();
+        if let Some(name) = iter.next() {
+            let clean = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+            if clean.eq_ignore_ascii_case(column_name) {
+                return Ok(i);
+            }
+        }
+    }
+    bail!("column not found")
+}
+
+fn extract_column_from_table_cell(page: &[u8], cell_offset: usize, col_index: usize) -> Result<Option<String>> {
+    let (_payload_size, len1) = read_varint(page, cell_offset);
+    let (_rowid, len2) = read_varint(page, cell_offset + len1);
+    let header_start = cell_offset + len1 + len2;
+    let (header_size, len3) = read_varint(page, header_start);
+    let mut header_pos = header_start + len3;
+
+    let mut serials = Vec::new();
+    while header_pos < header_start + header_size as usize {
+        let (st, l) = read_varint(page, header_pos);
+        serials.push(st);
+        header_pos += l;
+    }
+
+    if col_index >= serials.len() {
+        return Ok(None);
+    }
+
+    let body_start = header_start + header_size as usize;
+    let mut body_pos = body_start;
+
+    for (idx, st) in serials.iter().enumerate() {
+        let size = serial_type_size(*st);
+        if idx == col_index {
+            if size == 0 {
+                return Ok(None);
+            }
+            let bytes = &page[body_pos..body_pos + size];
+            let s = String::from_utf8(bytes.to_vec())?;
+            return Ok(Some(s));
+        }
+        body_pos += size;
+    }
+
+    Ok(None)
 }

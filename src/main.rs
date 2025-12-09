@@ -46,10 +46,17 @@ fn main() -> Result<()> {
                 let count = count_rows_in_table(&mut file, &table_name)?;
                 println!("{}", count);
             } else if upper.starts_with("SELECT") {
-                let (col, table) = parse_select_column_query(command);
-                let values = select_column_from_table(&mut file, &table, &col)?;
-                for v in values {
-                    println!("{}", v);
+                let (cols, table) = parse_select_columns_query(command);
+                if cols.len() == 1 {
+                    let values = select_column_from_table(&mut file, &table, &cols[0])?;
+                    for v in values {
+                        println!("{}", v);
+                    }
+                } else {
+                    let rows = select_columns_from_table(&mut file, &table, &cols)?;
+                    for row in rows {
+                        println!("{}", row.join("|"));
+                    }
                 }
             } else {
                 bail!("Missing or invalid command passed: {}", command)
@@ -269,11 +276,26 @@ fn extract_schema_row_from_cell(page: &[u8], cell_offset: usize) -> Result<Schem
     Ok(SchemaRow { tbl_name, rootpage, sql })
 }
 
-fn parse_select_column_query(query: &str) -> (String, String) {
-    let parts: Vec<&str> = query.split_whitespace().collect();
-    let col = parts.get(1).unwrap_or(&"").trim().trim_end_matches(',').to_string();
-    let table = parts.last().unwrap_or(&"").trim_end_matches(';').to_string();
-    (col, table)
+fn parse_select_columns_query(query: &str) -> (Vec<String>, String) {
+    let upper = query.to_uppercase();
+    let select_pos = upper.find("SELECT").unwrap_or(0);
+    let from_pos = upper.find("FROM").unwrap_or(query.len());
+    let cols_part = &query[select_pos + 6..from_pos];
+    let cols: Vec<String> = cols_part
+        .split(',')
+        .map(|c| c.trim().trim_end_matches(',').to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    let after_from = &query[from_pos + 4..];
+    let table = after_from
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(';')
+        .to_string();
+
+    (cols, table)
 }
 
 fn select_column_from_table(file: &mut File, table_name: &str, column_name: &str) -> Result<Vec<String>> {
@@ -333,6 +355,73 @@ fn select_column_from_table(file: &mut File, table_name: &str, column_name: &str
     }
 
     Ok(result)
+}
+
+fn select_columns_from_table(file: &mut File, table_name: &str, columns: &[String]) -> Result<Vec<Vec<String>>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 100];
+    file.read_exact(&mut header)?;
+    let page_size = u16::from_be_bytes([header[16], header[17]]) as usize;
+
+    let mut page = vec![0u8; page_size];
+    page[..100].copy_from_slice(&header);
+    file.read_exact(&mut page[100..])?;
+
+    let page_header_offset = 100;
+    let cell_count =
+        u16::from_be_bytes([page[page_header_offset + 3], page[page_header_offset + 4]]) as usize;
+    let cell_ptr_array_offset = page_header_offset + 8;
+
+    let mut target_row: Option<SchemaRow> = None;
+
+    for i in 0..cell_count {
+        let idx = cell_ptr_array_offset + i * 2;
+        let cell_offset = u16::from_be_bytes([page[idx], page[idx + 1]]) as usize;
+        let row = extract_schema_row_from_cell(&page, cell_offset)?;
+        if row.tbl_name == table_name {
+            target_row = Some(row);
+            break;
+        }
+    }
+
+    let schema_row = match target_row {
+        Some(r) => r,
+        None => bail!("table not found"),
+    };
+
+    let mut indexes = Vec::new();
+    for col in columns {
+        let idx = get_column_index_from_sql(&schema_row.sql, col)?;
+        indexes.push(idx);
+    }
+
+    let page_start: u64 = (schema_row.rootpage as u64 - 1) * page_size as u64;
+    file.seek(SeekFrom::Start(page_start))?;
+
+    let mut root_page = vec![0u8; page_size];
+    file.read_exact(&mut root_page)?;
+
+    let root_header_offset = if schema_row.rootpage == 1 { 100 } else { 0 };
+    let cell_count =
+        u16::from_be_bytes([root_page[root_header_offset + 3], root_page[root_header_offset + 4]])
+            as usize;
+    let cell_ptr_array_offset = root_header_offset + 8;
+
+    let mut rows = Vec::new();
+
+    for i in 0..cell_count {
+        let idx = cell_ptr_array_offset + i * 2;
+        let cell_offset = u16::from_be_bytes([root_page[idx], root_page[idx + 1]]) as usize;
+
+        let mut row_vals = Vec::new();
+        for &col_idx in &indexes {
+            let v = extract_column_from_table_cell(&root_page, cell_offset, col_idx)?;
+            row_vals.push(v.unwrap_or_default());
+        }
+        rows.push(row_vals);
+    }
+
+    Ok(rows)
 }
 
 fn get_column_index_from_sql(sql: &str, column_name: &str) -> Result<usize> {

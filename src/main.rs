@@ -526,35 +526,86 @@ fn select_columns_from_table_where(
     }
     let where_index = get_column_index_from_sql(&schema_row.sql, where_col)?;
 
-    let page_start: u64 = (schema_row.rootpage as u64 - 1) * page_size as u64;
+    let rows = scan_table_btree_where(
+        file,
+        schema_row.rootpage,
+        page_size,
+        &indexes,
+        where_index,
+        where_val,
+    )?;
+
+    Ok(rows)
+}
+
+fn scan_table_btree_where(
+    file: &mut File,
+    page_no: u32,
+    page_size: usize,
+    indexes: &[usize],
+    where_index: usize,
+    where_val: &str,
+) -> Result<Vec<Vec<String>>> {
+    let page_start: u64 = (page_no as u64 - 1) * page_size as u64;
     file.seek(SeekFrom::Start(page_start))?;
+    let mut page = vec![0u8; page_size];
+    file.read_exact(&mut page)?;
 
-    let mut root_page = vec![0u8; page_size];
-    file.read_exact(&mut root_page)?;
-
-    let root_header_offset = if schema_row.rootpage == 1 { 100 } else { 0 };
+    let header_offset = if page_no == 1 { 100 } else { 0 };
+    let page_type = page[header_offset];
     let cell_count =
-        u16::from_be_bytes([root_page[root_header_offset + 3], root_page[root_header_offset + 4]])
-            as usize;
-    let cell_ptr_array_offset = root_header_offset + 8;
+        u16::from_be_bytes([page[header_offset + 3], page[header_offset + 4]]) as usize;
 
     let mut rows = Vec::new();
 
-    for i in 0..cell_count {
-        let idx = cell_ptr_array_offset + i * 2;
-        let cell_offset = u16::from_be_bytes([root_page[idx], root_page[idx + 1]]) as usize;
+    if page_type == 0x0D {
+        let cell_ptr_array_offset = header_offset + 8;
+        for i in 0..cell_count {
+            let idx = cell_ptr_array_offset + i * 2;
+            let cell_offset = u16::from_be_bytes([page[idx], page[idx + 1]]) as usize;
 
-        let where_v = extract_column_from_table_cell(&root_page, cell_offset, where_index)?;
-        if let Some(ref w) = where_v {
-            if w == where_val {
-                let mut row_vals = Vec::new();
-                for &col_idx in &indexes {
-                    let v = extract_column_from_table_cell(&root_page, cell_offset, col_idx)?;
-                    row_vals.push(v.unwrap_or_default());
+            let where_v = extract_column_from_table_cell(&page, cell_offset, where_index)?;
+            if let Some(ref w) = where_v {
+                if w == where_val {
+                    let mut row_vals = Vec::new();
+                    for &col_idx in indexes {
+                        let v = extract_column_from_table_cell(&page, cell_offset, col_idx)?;
+                        row_vals.push(v.unwrap_or_default());
+                    }
+                    rows.push(row_vals);
                 }
-                rows.push(row_vals);
             }
         }
+    } else if page_type == 0x05 {
+        let right_child = u32::from_be_bytes([
+            page[header_offset + 8],
+            page[header_offset + 9],
+            page[header_offset + 10],
+            page[header_offset + 11],
+        ]);
+        let cell_ptr_array_offset = header_offset + 12;
+        for i in 0..cell_count {
+            let idx = cell_ptr_array_offset + i * 2;
+            let cell_offset = u16::from_be_bytes([page[idx], page[idx + 1]]) as usize;
+            let child_page = u32::from_be_bytes([
+                page[cell_offset],
+                page[cell_offset + 1],
+                page[cell_offset + 2],
+                page[cell_offset + 3],
+            ]);
+            let mut child_rows = scan_table_btree_where(
+                file,
+                child_page,
+                page_size,
+                indexes,
+                where_index,
+                where_val,
+            )?;
+            rows.append(&mut child_rows);
+        }
+        let mut right_rows =
+            scan_table_btree_where(file, right_child, page_size, indexes, where_index, where_val)?;
+        rows.append(&mut right_rows);
     }
 
     Ok(rows)

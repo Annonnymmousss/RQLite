@@ -23,11 +23,15 @@ fn main() -> Result<()> {
             #[allow(unused_variables)]
             let page_size = u16::from_be_bytes([header[16], header[17]]);
 
+            // Read number of tables from sqlite_schema (page 1)
+            let table_count = read_number_of_tables(&mut file)?;
+
             // You can use print statements as follows for debugging, they'll be visible when running tests.
             eprintln!("Logs from your program will appear here!");
 
-            // TODO: Uncomment the code below to pass the first stage
+            // Output as required by the tests
             println!("database page size: {}", page_size);
+            println!("number of tables: {}", table_count);
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
@@ -35,4 +39,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn read_number_of_tables(file: &mut File) -> Result<u16> {
+  
+    let mut page_header = [0u8; 8];
+    file.read_exact(&mut page_header)?;
 
+
+    let cell_count = u16::from_be_bytes([page_header[3], page_header[4]]);
+    Ok(cell_count)
+}

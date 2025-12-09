@@ -641,7 +641,7 @@ fn get_column_index_from_sql(sql: &str, column_name: &str) -> Result<usize> {
 
 fn extract_column_from_table_cell(page: &[u8], cell_offset: usize, col_index: usize) -> Result<Option<String>> {
     let (_payload_size, len1) = read_varint(page, cell_offset);
-    let (_rowid, len2) = read_varint(page, cell_offset + len1);
+    let (rowid, len2) = read_varint(page, cell_offset + len1);
     let header_start = cell_offset + len1 + len2;
     let (header_size, len3) = read_varint(page, header_start);
     let mut header_pos = header_start + len3;
@@ -664,7 +664,11 @@ fn extract_column_from_table_cell(page: &[u8], cell_offset: usize, col_index: us
         let size = serial_type_size(*st);
         if idx == col_index {
             if size == 0 {
-                return Ok(None);
+                if col_index == 0 {
+                    return Ok(Some(rowid.to_string()));
+                } else {
+                    return Ok(None);
+                }
             }
             let bytes = &page[body_pos..body_pos + size];
             let s = String::from_utf8(bytes.to_vec())?;
